@@ -418,6 +418,7 @@ tdq_print(int cpu)
 	runq_print(&tdq->tdq_idle);
 }
 
+//1 if should preempt, 0 if shouldnt
 static inline int
 sched_shouldpreempt(int pri, int cpri, int remote)
 {
