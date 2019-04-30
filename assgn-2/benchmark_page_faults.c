@@ -9,15 +9,6 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 
-#define RUSAGE_THREAD 1
-#define RUSAGE_SELF 0
-#define NUMBER_OF_THREADS 32
-
-void *print_hello_world(void *tid) {
-   printf("Hello World. Greetings from thread %d\n", tid);
-   pthread_exit(NULL);
-}
-
 int main(int argc, char **argv){
     struct rusage usage; 
     int i, execute;
@@ -25,7 +16,7 @@ int main(int argc, char **argv){
     char *file[10];
     long pagefault;
 
-    getrusage(RUSAGE_SELF, &usage);
+    // getrusage(RUSAGE_SELF, &usage);
 
     child = fork();
     
@@ -40,16 +31,15 @@ int main(int argc, char **argv){
         if(execute < 0){
             perror("Executing error: ");
             exit(1);
-        } else {
-           pagefault = usage.ru_majflt; 
-           printf("Number of page faults: %-10ld\t%s\n", pagefault); 
-        }
+        } 
         exit(0);
     }
 
     waitpid(child, (void *) 0, 0);
 
-
+    getrusage(RUSAGE_SELF, &usage); 
+    pagefault = usage.ru_majflt; 
+    printf("Number of page faults: %-10ld\t%s\n", pagefault); 
     
 
     }
