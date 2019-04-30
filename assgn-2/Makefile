@@ -1,14 +1,13 @@
-SUBMITFILES = sched_ule.c Makefile README
+SUBMITFILES = sched_ule.c benchmark.c Makefile README
 CFLAGS = -Wall -Werror -Wextra -pedantic -O3 -Wshadow
 
-all: 
-	cc -o myshell myshell.o lex.yy.o -lfl
+all: benchmark
 
-benchmark : benchmark.o
-	cc -o benchmark benchmark.o
+benchmark : benchmark.o printLoop.o
+	cc -o benchmark benchmark.o printLoop.o
 
-benchmark.o : benchmark.c
-	cc -c ${CFLAGS} benchmark.c
+benchmark.o : benchmark.c printLoop.c
+	cc -c ${CFLAGS} benchmark.c printLoop.c
 
 infer:
 	make clean; infer-capture -- make benchmark; infer-analyze -- make 
