@@ -65,7 +65,14 @@ __FBSDID("$FreeBSD: releng/12.0/sys/kern/sched_ule.c 336855 2018-07-29 00:30:06Z
 #include <sys/vmmeter.h>
 #include <sys/cpuset.h>
 #include <sys/sbuf.h>
+#include <sys/types.h>  // need for getrusage
+#include <sys/time.h>   // need for getrusage
 
+/* need for getrusage */
+#define	RUSAGE_SELF	 0   
+#define	RUSAGE_CHILDREN	-1
+#define	RUSAGE_THREAD	1
+/*.......................*/
 #ifdef HWPMC_HOOKS
 #include <sys/pmckern.h>
 #endif
@@ -88,6 +95,7 @@ dtrace_vtime_switch_func_t	dtrace_vtime_switch_func;
 /*
  * Thread scheduler specific section.  All fields are protected
  * by the thread lock.
+ * tick = time slice, 1 tick = 10 millisec, max time = 140 milliseconds, max time = 14 ticks
  */
 struct td_sched {	
 	struct runq	*ts_runq;	/* Run-queue we're queued on. */
@@ -95,17 +103,17 @@ struct td_sched {
 	int		ts_cpu;		/* CPU that we have affinity for. */
 	int		ts_rltick;	/* Real last tick, for affinity. */
 	int		ts_slice;	/* Ticks of slice remaining. */
-	u_int		ts_slptime;	/* Number of ticks we vol. slept */
-	u_int		ts_runtime;	/* Number of ticks we were running */
-	int		ts_ltick;	/* Last tick that we were running on */
-	int		ts_ftick;	/* First tick that we were running on */
-	int		ts_ticks;	/* Tick count */
+	u_int		ts_slptime;	/* Number of ticks we vol. slept - use to get interactivity score */
+	u_int		ts_runtime;	/* Number of ticks we were running - use to get interactivity score */
+	int		ts_ltick;	/* Last tick that we were running on- calculate sleep time and run time */
+	int		ts_ftick;	/* First tick that we were running on \- calculate sleep time and run time */
+	int		ts_ticks;	/* Tick count- how long the time slices are */
 #ifdef KTR
 	char		ts_name[TS_NAME_LEN];
 #endif
 };
-/* flags kept in ts_flags */
-#define	TSF_BOUND	0x0001		/* Thread can not migrate. */
+/* flags kept in ts_flags- local variable in struct */
+#define	TSF_BOUND	0x0001		/* Thread can not migrate.- either boundary value or if bound, it is 1 */
 #define	TSF_XFERABLE	0x0002		/* Thread was added as transferable. */
 
 #define	THREAD_CAN_MIGRATE(td)	((td)->td_pinned == 0)
@@ -123,12 +131,12 @@ _Static_assert(sizeof(struct thread) + sizeof(struct td_sched) <=
  * (NHALF, x, and NHALF) handle non-interactive threads with the outer
  * ranges supporting nice values.
  */
-#define	PRI_TIMESHARE_RANGE	(PRI_MAX_TIMESHARE - PRI_MIN_TIMESHARE + 1)
-#define	PRI_INTERACT_RANGE	((PRI_TIMESHARE_RANGE - SCHED_PRI_NRESV) / 2)
-#define	PRI_BATCH_RANGE		(PRI_TIMESHARE_RANGE - PRI_INTERACT_RANGE)
+#define	PRI_TIMESHARE_RANGE	(PRI_MAX_TIMESHARE - PRI_MIN_TIMESHARE + 1) // range = max - min for timeshare 
+#define	PRI_INTERACT_RANGE	((PRI_TIMESHARE_RANGE - SCHED_PRI_NRESV) / 2) // interactive range 
+#define	PRI_BATCH_RANGE		(PRI_TIMESHARE_RANGE - PRI_INTERACT_RANGE) // priority of batch range
 
 #define	PRI_MIN_INTERACT	PRI_MIN_TIMESHARE
-#define	PRI_MAX_INTERACT	(PRI_MIN_TIMESHARE + PRI_INTERACT_RANGE - 1)
+#define	PRI_MAX_INTERACT	(PRI_MIN_TIMESHARE + PRI_INTERACT_RANGE - 1) 
 #define	PRI_MIN_BATCH		(PRI_MIN_TIMESHARE + PRI_INTERACT_RANGE)
 #define	PRI_MAX_BATCH		PRI_MAX_TIMESHARE
 
@@ -141,10 +149,11 @@ _Static_assert(sizeof(struct thread) + sizeof(struct td_sched) <=
  * SCHED_TICK_SHIFT:	Shift factor to avoid rounding away results.
  * SCHED_TICK_HZ:	Compute the number of hz ticks for a given ticks count.
  * SCHED_TICK_TOTAL:	Gives the amount of time we've been recording ticks.
+ * useful for benchmarks
  */
-#define	SCHED_TICK_SECS		10
-#define	SCHED_TICK_TARG		(hz * SCHED_TICK_SECS)
-#define	SCHED_TICK_MAX		(SCHED_TICK_TARG + hz)
+#define	SCHED_TICK_SECS		10						// seconds to average cpu usage 
+#define	SCHED_TICK_TARG		(hz * SCHED_TICK_SECS)  // scaling to frequency 
+#define	SCHED_TICK_MAX		(SCHED_TICK_TARG + hz)  // 
 #define	SCHED_TICK_SHIFT	10
 #define	SCHED_TICK_HZ(ts)	((ts)->ts_ticks >> SCHED_TICK_SHIFT)
 #define	SCHED_TICK_TOTAL(ts)	(max((ts)->ts_ltick - (ts)->ts_ftick, hz))
@@ -161,10 +170,10 @@ _Static_assert(sizeof(struct thread) + sizeof(struct td_sched) <=
  * PRI_TICKS:	Compute a priority in PRI_RANGE from the ticks count and total.
  * PRI_NICE:	Determines the part of the priority inherited from nice.
  */
-#define	SCHED_PRI_NRESV		(PRIO_MAX - PRIO_MIN)
-#define	SCHED_PRI_NHALF		(SCHED_PRI_NRESV / 2)
-#define	SCHED_PRI_MIN		(PRI_MIN_BATCH + SCHED_PRI_NHALF)
-#define	SCHED_PRI_MAX		(PRI_MAX_BATCH - SCHED_PRI_NHALF)
+#define	SCHED_PRI_NRESV		(PRIO_MAX - PRIO_MIN)   // number of nice values = max priority - min priority 
+#define	SCHED_PRI_NHALF		(SCHED_PRI_NRESV / 2)   // number of nice values / 2
+#define	SCHED_PRI_MIN		(PRI_MIN_BATCH + SCHED_PRI_NHALF) // min priority value
+#define	SCHED_PRI_MAX		(PRI_MAX_BATCH - SCHED_PRI_NHALF) // 
 #define	SCHED_PRI_RANGE		(SCHED_PRI_MAX - SCHED_PRI_MIN + 1)
 #define	SCHED_PRI_TICKS(ts)						\
     (SCHED_TICK_HZ((ts)) /						\
@@ -183,11 +192,11 @@ _Static_assert(sizeof(struct thread) + sizeof(struct td_sched) <=
  * INTERACT_MAX:	Maximum interactivity value.  Smaller is better.
  * INTERACT_THRESH:	Threshold for placement on the current runq.
  */
-#define	SCHED_SLP_RUN_MAX	((hz * 5) << SCHED_TICK_SHIFT)
-#define	SCHED_SLP_RUN_FORK	((hz / 2) << SCHED_TICK_SHIFT)
-#define	SCHED_INTERACT_MAX	(100)
-#define	SCHED_INTERACT_HALF	(SCHED_INTERACT_MAX / 2)
-#define	SCHED_INTERACT_THRESH	(30)
+#define	SCHED_SLP_RUN_MAX	((hz * 5) << SCHED_TICK_SHIFT) // max sleep and run time before throttled back 
+#define	SCHED_SLP_RUN_FORK	((hz / 2) << SCHED_TICK_SHIFT) // fork time max sleep and run time 
+#define	SCHED_INTERACT_MAX	(100) // interactivity max value 
+#define	SCHED_INTERACT_HALF	(SCHED_INTERACT_MAX / 2) 
+#define	SCHED_INTERACT_THRESH	(30) // interactive threshold 
 
 /*
  * These parameters determine the slice behavior for batch work.
@@ -221,8 +230,8 @@ static int preempt_thresh = PRI_MIN_KERN;
 static int preempt_thresh = 0;
 #endif
 static int static_boost = PRI_MIN_BATCH;
-static int sched_idlespins = 10000;
-static int sched_idlespinthresh = -1;
+static int sched_idlespins = 10000; // how long spin locks are held for
+static int sched_idlespinthresh = -1; 
 
 /*
  * tdq - per processor runqs and statistics.  All fields are protected by the
@@ -249,7 +258,7 @@ struct tdq {
 	u_char		tdq_ridx;		/* Current removal index. */
 	struct runq	tdq_realtime;		/* real-time run queue. */
 	struct runq	tdq_timeshare;		/* timeshare run queue. */
-	struct runq	tdq_idle;		/* Queue of IDLE threads. */
+	struct runq	tdq_idle;		/* Queue of IDLE threads. - idle queue */
 	char		tdq_name[TDQ_NAME_LEN];
 #ifdef KTR
 	char		tdq_loadname[TDQ_LOADNAME_LEN];
@@ -303,22 +312,22 @@ static struct tdq	tdq_cpu;
 #define	TDQ_LOCKPTR(t)		((struct mtx *)(&(t)->tdq_lock))
 
 static void sched_priority(struct thread *);
-static void sched_thread_priority(struct thread *, u_char);
-static int sched_interact_score(struct thread *);
-static void sched_interact_update(struct thread *);
-static void sched_interact_fork(struct thread *);
-static void sched_pctcpu_update(struct td_sched *, int);
+static void sched_thread_priority(struct thread *, u_char); // thread priority 
+static int sched_interact_score(struct thread *); // thread interactivity score 
+static void sched_interact_update(struct thread *); // update interactivity 
+static void sched_interact_fork(struct thread *); // interactivity score when fork
+static void sched_pctcpu_update(struct td_sched *, int); // program counter for cpu
 
 /* Operations on per processor queues */
-static struct thread *tdq_choose(struct tdq *);
-static void tdq_setup(struct tdq *);
-static void tdq_load_add(struct tdq *, struct thread *);
-static void tdq_load_rem(struct tdq *, struct thread *);
-static __inline void tdq_runq_add(struct tdq *, struct thread *, int);
-static __inline void tdq_runq_rem(struct tdq *, struct thread *);
-static inline int sched_shouldpreempt(int, int, int);
-void tdq_print(int cpu);
-static void runq_print(struct runq *rq);
+static struct thread *tdq_choose(struct tdq *); // 
+static void tdq_setup(struct tdq *); // set up thread 
+static void tdq_load_add(struct tdq *, struct thread *); // add threads 
+static void tdq_load_rem(struct tdq *, struct thread *); // remove threads
+static __inline void tdq_runq_add(struct tdq *, struct thread *, int); // actually adds threads to queue 
+static __inline void tdq_runq_rem(struct tdq *, struct thread *); // actually removes threads from queue 
+static inline int sched_shouldpreempt(int, int, int); // idk, something with preemption 
+void tdq_print(int cpu); // Print the status of a per-cpu thread queue 
+static void runq_print(struct runq *rq); // prints threads waiting on run queue 
 static void tdq_add(struct tdq *, struct thread *, int);
 #ifdef SMP
 static struct thread *tdq_move(struct tdq *, struct tdq *);
@@ -338,13 +347,13 @@ static int sysctl_kern_sched_topology_spec_internal(struct sbuf *sb,
 #endif
 
 static void sched_setup(void *dummy);
-SYSINIT(sched_setup, SI_SUB_RUN_QUEUE, SI_ORDER_FIRST, sched_setup, NULL);
+SYSINIT(sched_setup, SI_SUB_RUN_QUEUE, SI_ORDER_FIRST, sched_setup, NULL); // https://www.freebsd.org/cgi/man.cgi?query=SYSINIT&sektion=9
 
 static void sched_initticks(void *dummy);
-SYSINIT(sched_initticks, SI_SUB_CLOCKS, SI_ORDER_THIRD, sched_initticks,
+SYSINIT(sched_initticks, SI_SUB_CLOCKS, SI_ORDER_THIRD, sched_initticks, // https://www.freebsd.org/cgi/man.cgi?query=SYSINIT&sektion=9
     NULL);
 
-SDT_PROVIDER_DEFINE(sched);
+SDT_PROVIDER_DEFINE(sched); // https://www.freebsd.org/cgi/man.cgi?query=SDT&apropos=0&sektion=9&manpath=FreeBSD+11-current&format=html
 
 SDT_PROBE_DEFINE3(sched, , , change__pri, "struct thread *", 
     "struct proc *", "uint8_t");
@@ -418,7 +427,6 @@ tdq_print(int cpu)
 	runq_print(&tdq->tdq_idle);
 }
 
-//1 if should preempt, 0 if shouldnt
 static inline int
 sched_shouldpreempt(int pri, int cpri, int remote)
 {
@@ -617,7 +625,7 @@ tdq_setlowpri(struct tdq *tdq, struct thread *ctd)
  * Generator X_{n+1}=(aX_n+c) mod m. These values are optimized for
  * m = 2^32, a = 69069 and c = 5. We only return the upper 16 bits
  * of the random state (in the low bits of our answer) to keep
- * the maximum randomness.
+ * the maximum randomness. 
  */
 static uint32_t
 sched_random(void)
