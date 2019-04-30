@@ -1,4 +1,4 @@
-SUBMITFILES = sched_ule.c Makefile README
+SUBMITFILES = sched_ule.c benchmark.c Makefile README
 CFLAGS = -Wall -Werror -Wextra -pedantic -O3 -Wshadow
 
 all: benchmark
